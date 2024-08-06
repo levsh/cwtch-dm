@@ -1,17 +1,19 @@
 import re
+import typing
 from asyncio import TaskGroup
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Any, Literal, Type
+from typing import Any, Callable, Literal, Never, Type
 
 import sqlalchemy as sa
 from cwtch import asdict, dataclass, from_attributes
-from sqlalchemy import delete, insert, literal, select, union_all, update
+from sqlalchemy import delete, func, insert, literal, select, union_all, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 __all__ = [
     "AlreadyExistsError",
+    "BadParamsError",
     "NepenteError",
     "NotFoundError",
     "OrderBy",
@@ -35,13 +37,25 @@ class NepenteError(Exception):
     pass
 
 
+class BadParamsError(NepenteError):
+    def __init__(self, message: str, param: str | None = None):
+        self.message = message
+        self.param = param
+
+    def __str__(self):
+        return self.message
+
+    def __repr__(self):
+        return self.__str__()
+
+
 class NotFoundError(NepenteError):
     def __init__(self, key, value):
         self.key = key
         self.value = value
 
     def __str__(self):
-        return f"item with {self.key} '{self.value}' not found"
+        return f"item with ({self.key})=({self.value}) not found"
 
 
 class AlreadyExistsError(NepenteError):
@@ -73,7 +87,7 @@ async def transaction(engine_name: str | None = None):
 
 
 @asynccontextmanager
-async def _get_conn(engine_name: str | None = None):
+async def get_conn(engine_name: str | None = None):
     if (conn := _conn[engine_name].get()) is None:
         async with _engine[engine_name].connect() as conn:
             async with conn.begin():
@@ -83,15 +97,15 @@ async def _get_conn(engine_name: str | None = None):
 
 
 @asynccontextmanager
-async def _get_sess(engine_name: str | None = None):
-    async with _get_conn(engine_name=engine_name) as conn:
+async def get_sess(engine_name: str | None = None):
+    async with get_conn(engine_name=engine_name) as conn:
         async_session = async_sessionmaker(conn, expire_on_commit=False)
         async with async_session() as sess:
             async with sess.begin():
                 yield sess
 
 
-def raise_exc(e: Exception):
+def raise_exc(e: Exception) -> Never:
     if isinstance(e, sa.exc.IntegrityError):
         detail_match = re.match(r".*\nDETAIL:\s*(?P<text>.*)$", e.orig.args[0])
         if detail_match:
@@ -139,11 +153,11 @@ class Meta(type):
         return super().__new__(cls, name, bases, ns)
 
     def __getattribute__(cls, name):
-        if name in {"create", "create_many"} and super().__getattribute__("model_create") is False:
+        if name in ("create", "create_many") and super().__getattribute__("model_create") is False:
             raise Exception("model_create is not defined")
-        if name in {"save", "save_many"} and super().__getattribute__("model_save") is False:
+        if name in ("save", "save_many") and super().__getattribute__("model_save") is False:
             raise Exception("model_save is not defined")
-        if name in {"update", "update_many"} and super().__getattribute__("model_update") is False:
+        if name in ("update", "update_many") and super().__getattribute__("model_update") is False:
             raise Exception("model_update is not defined")
         return super().__getattribute__(name)
 
@@ -151,16 +165,21 @@ class Meta(type):
 class CRUD(metaclass=Meta):
     engine_name: str | None = None
 
-    model_db = None
+    model_db: sa.Table = typing.cast(sa.Table, None)
 
-    model: Type = None
-    model_create: Type | bool = None
-    model_save: Type | bool = None
-    model_update: Type | bool = None
+    model: Type = typing.cast(Type, None)
+    model_create: Type | bool = typing.cast(Type, None)
+    model_save: Type | bool = typing.cast(Type, None)
+    model_update: Type | bool = typing.cast(Type, None)
 
-    key = None
+    key: str | sa.Column = typing.cast(str, None)
     index_elements: list | None = None
-    order_by: list[OrderBy] | OrderBy | str | None = None
+
+    order_by: list[OrderBy] | OrderBy | str | Callable | sa.Column = typing.cast(
+        list[OrderBy] | OrderBy | str | Callable | sa.Column,
+        None,
+    )
+
     joinedload: dict = {}
 
     _fields_create: set[str] = set()
@@ -168,8 +187,8 @@ class CRUD(metaclass=Meta):
     _fields_update: set[str] = set()
 
     @classmethod
-    async def _execute(cls, stmt):
-        async with _get_conn(engine_name=cls.engine_name) as conn:
+    async def _execute(cls, stmt) -> sa.ResultProxy:
+        async with get_conn(engine_name=cls.engine_name) as conn:
             try:
                 return await conn.execute(stmt)
             except Exception as e:
@@ -186,24 +205,32 @@ class CRUD(metaclass=Meta):
         return key
 
     @classmethod
-    def _get_order_by(cls, order_by: list[OrderBy] | OrderBy | str | None = None) -> list | None:
+    def _get_order_by(cls, c, order_by: list[OrderBy] | OrderBy | str | None = None) -> list | None:
         if order_by is None:
-            order_by = cls.order_by or cls._get_key()
+            if callable(cls.order_by):
+                order_by = cls.order_by(c)
+            else:
+                order_by = cls.order_by or cls._get_key()  # type: ignore
         if order_by is not None:
             if not isinstance(order_by, list):
                 order_by = [order_by]
             else:
                 order_by = list(order_by)
+            order_by: list
             for i, x in enumerate(order_by):
-                if not isinstance(x, OrderBy):
-                    x = OrderBy(by=x, order="asc")
+                if isinstance(x, OrderBy):
+                    x = OrderBy(by=typing.cast(OrderBy, x).by, order=typing.cast(OrderBy, x).order)
+                else:
+                    x = OrderBy(by=x)
                 if isinstance(x.by, str):
-                    x.by = getattr(cls.model_db, x.by)
+                    if getattr(c, x.by, None) is None:
+                        raise BadParamsError(f"invalid order_by '{x.by}'", param=f"{x.by}")
+                    x.by = getattr(c, x.by)
                 order_by[i] = getattr(sa, x.order)(x.by)
         return order_by
 
     @classmethod
-    def _make_from_db_data(cls, item_db, joinedload: dict | None = None) -> dict | None:
+    def _make_from_db_data(cls, db_item, row: tuple | None = None, joinedload: dict | None = None) -> dict | None:
         return {}
 
     @classmethod
@@ -230,25 +257,25 @@ class CRUD(metaclass=Meta):
 
     @classmethod
     def _make_create_stmt(cls, model, returning: bool | None = None):
-        model_db = cls.model_db
         if returning:
+            model_db = cls.model_db
             return insert(model_db).values(cls._get_create_values(model)).returning(model_db)
         return insert(cls.model_db).values(cls._get_create_values(model))
 
     @classmethod
-    async def create(cls, model, model_out=None, returning: bool = True):
+    async def create(cls, model, model_out: Type | None = None, returning: bool = True):
         item_db = (await cls._execute(cls._make_create_stmt(model, returning=returning))).one()
         return cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
 
     @classmethod
     def _make_create_many_stmt(cls, models: list, returning: bool | None = None):
-        model_db = cls.model_db
         if returning:
+            model_db = cls.model_db
             return insert(model_db).values([cls._get_create_values(model) for model in models]).returning(model_db)
-        return insert(model_db).values([cls._get_create_values(model) for model in models])
+        return insert(cls.model_db).values([cls._get_create_values(model) for model in models])
 
     @classmethod
-    async def create_many(cls, models: list, model_out=None, returning: bool = True) -> list:
+    async def create_many(cls, models: list, model_out: Type | None = None, returning: bool = True) -> list:
         if not models:
             return []
         if len({model.__class__ for model in models}) > 1:
@@ -260,13 +287,13 @@ class CRUD(metaclass=Meta):
 
     @classmethod
     def _get_save_values(cls, model) -> dict:
-        if isinstance(model, cls.model_create):
+        if isinstance(model, typing.cast(Type, cls.model_create)):
             return asdict(model, include=cls._fields_create)
         return asdict(model, include=cls._fields_save)
 
     @classmethod
     def _get_save_set(cls, excluded, model) -> dict:
-        if isinstance(model, cls.model_create):
+        if isinstance(model, typing.cast(Type, cls.model_create)):
             return {k: getattr(excluded, k) for k in cls._create_fields}
         return {k: getattr(excluded, k) for k in cls._fields_save}
 
@@ -289,7 +316,13 @@ class CRUD(metaclass=Meta):
         )
 
     @classmethod
-    async def save(cls, model, index_elements: list | None = None, model_out=None, returning: bool = True):
+    async def save(
+        cls,
+        model,
+        index_elements: list | None = None,
+        model_out: Type | None = None,
+        returning: bool = True,
+    ):
         item_db = (
             await cls._execute(
                 cls._make_save_stmt(
@@ -324,7 +357,7 @@ class CRUD(metaclass=Meta):
         cls,
         models: list,
         index_elements: list | None = None,
-        model_out=None,
+        model_out: Type | None = None,
         returning: bool = True,
     ) -> list:
         if not models:
@@ -366,7 +399,13 @@ class CRUD(metaclass=Meta):
         )
 
     @classmethod
-    async def update(cls, model, key: str, model_out=None, returning: bool = True):
+    async def update(
+        cls,
+        model,
+        key: str,
+        model_out: Type | None = None,
+        returning: bool = True,
+    ):
         if item_db := (await cls._execute(cls._make_update_stmt(model, key, returning=returning))).one_or_none():
             if returning:
                 return cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
@@ -374,7 +413,13 @@ class CRUD(metaclass=Meta):
             raise NotFoundError(key=key, value=getattr(model, key))
 
     @classmethod
-    async def update_many(cls, models: list, key: str, model_out=None, returning: bool = True) -> list:
+    async def update_many(
+        cls,
+        models: list,
+        key: str,
+        model_out: Type | None = None,
+        returning: bool = True,
+    ) -> list:
         async with TaskGroup() as tg:
             tasks = [
                 tg.create_task(cls.update(model, key, model_out=model_out, returning=returning)) for model in models
@@ -382,7 +427,7 @@ class CRUD(metaclass=Meta):
         return [await task for task in tasks]
 
     @classmethod
-    def _make_get_stmt(cls, key, key_value):
+    def _make_get_stmt(cls, key, key_value, **kwds):
         return select(cls.model_db).where(key == key_value)
 
     @classmethod
@@ -392,10 +437,11 @@ class CRUD(metaclass=Meta):
         key=None,
         raise_not_found: bool | None = None,
         joinedload: dict | None = None,
-        model_out=None,
+        model_out: Type | None = None,
+        **kwds,
     ):
         key = cls._get_key(key=key)
-        stmt = cls._make_get_stmt(key, key_value)
+        stmt = cls._make_get_stmt(key, key_value, **kwds)
 
         if joinedload is None or not any(joinedload.values()):
             if item_db := (await cls._execute(stmt)).one_or_none():
@@ -411,7 +457,7 @@ class CRUD(metaclass=Meta):
             else:
                 exclude.append(k)
 
-        async with _get_sess(engine_name=cls.engine_name) as sess:
+        async with get_sess(engine_name=cls.engine_name) as sess:
             if item_db := (await sess.execute(stmt)).unique().scalars().one_or_none():
                 return cls._from_db(
                     item_db,
@@ -423,30 +469,28 @@ class CRUD(metaclass=Meta):
                 raise NotFoundError(key=key, value=key_value)
 
     @classmethod
-    def _make_get_many_stmt(cls, *args, where=None, **kwds):
-        stmt = select(sa.func.count("*").over().label("rows_total"), cls.model_db)
-        if where is not None:
-            stmt = stmt.where(where)
-        return stmt
+    def _make_get_many_stmt(
+        cls,
+        order_by: list[OrderBy] | OrderBy | str | None = None,
+        **kwds,
+    ):
+        return select(func.count(literal("*")).over().label("rows_total"), cls.model_db).order_by(
+            *cls._get_order_by(cls.model_db, order_by)
+        )
 
     @classmethod
     async def get_many(
         cls,
-        where=None,
         page: int | None = None,
         page_size: int | None = None,
-        order_by=None,
+        order_by: list[OrderBy] | OrderBy | str | None = None,
         joinedload: dict | None = None,
-        model_out=None,
+        model_out: Type | None = None,
         **kwds,
     ) -> tuple[int, list]:
         model_db = cls.model_db
 
-        stmt = cls._make_get_many_stmt(where=where, **kwds)
-
-        order_by = cls._get_order_by(order_by)
-        if order_by:
-            stmt = stmt.order_by(*order_by)
+        stmt = cls._make_get_many_stmt(**kwds)
 
         cte = stmt.cte("cte")
 
@@ -456,7 +500,7 @@ class CRUD(metaclass=Meta):
             page = page or 1
             stmt = stmt.limit(page_size).offset((page - 1) * page_size)
 
-        stmt = union_all(select(sa.literal(0).label("i"), cte).limit(1), stmt)
+        stmt = union_all(select(literal(0).label("i"), cte).limit(1), stmt)
 
         from_db = cls._from_db
         make_from_orm_data = cls._make_from_db_data
@@ -468,36 +512,29 @@ class CRUD(metaclass=Meta):
             ]
 
         main_cte = stmt.cte("main_cte")
-        c = main_cte.c
 
-        stmt = select(c.i, c.rows_total, model_db)
+        model_db_alias = aliased(model_db, main_cte)  # type: ignore
+        stmt = select(main_cte, model_db_alias)
 
         exclude = []
         for k, v in cls.joinedload.items():
             if joinedload.get(k) is True:
-                stmt = stmt.options(v)
+                stmt = stmt.options(v(model_db_alias))
             else:
                 exclude.append(k)
 
-        stmt = stmt.join(
-            main_cte,
-            sa.and_(
-                *[
-                    getattr(model_db, column.name) == getattr(c, column.name)
-                    for column in model_db.__table__.primary_key.columns
-                ]
-            ),
-        ).order_by(sa.asc(c.i))
-        if order_by:
-            stmt = stmt.order_by(*order_by)
+        stmt = stmt.order_by(sa.asc(main_cte.c.i), *cls._get_order_by(main_cte.c, order_by))
 
-        async with _get_sess(engine_name=cls.engine_name) as sess:
-            rows = (await sess.execute(stmt)).unique().all()
+        def _hash(row):
+            return hash((row[0], row[1], row[-1]))
+
+        async with get_sess(engine_name=cls.engine_name) as sess:
+            rows = (await sess.execute(stmt)).unique(_hash).all()
             return rows[0].rows_total if rows else 0, [
                 from_db(
-                    row[2],
+                    row[-1],
                     exclude=exclude,
-                    data=make_from_orm_data(row[2], joinedload=joinedload),
+                    data=make_from_orm_data(row[-1], row=typing.cast(tuple, row), joinedload=joinedload),
                     model_out=model_out,
                 )
                 for row in rows[1:]
@@ -517,7 +554,13 @@ class CRUD(metaclass=Meta):
         ).returning(model_db)
 
     @classmethod
-    async def get_or_create(cls, model, update_element: str, index_elements: list | None = None, model_out=None):
+    async def get_or_create(
+        cls,
+        model,
+        update_element: str,
+        index_elements: list | None = None,
+        model_out: Type | None = None,
+    ):
         item_db = (
             await cls._execute(
                 cls._make_get_or_create_stmt(
@@ -542,7 +585,7 @@ class CRUD(metaclass=Meta):
         key=None,
         raise_not_found: bool | None = None,
         returning: bool | None = None,
-        model_out=None,
+        model_out: Type | None = None,
     ):
         key = cls._get_key(key=key)
         if returning:

@@ -24,7 +24,7 @@ def container_executor():
 @pytest.fixture(scope="class")
 def postgres(container_executor):
     container = container_executor.run_wait_up(
-        "postgres:13.7-alpine",
+        "postgres:15-alpine",
         environment={
             "POSTGRES_USER": POSTGRES_USER,
             "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
@@ -34,7 +34,7 @@ def postgres(container_executor):
     )
     ip = get_ip(container)
     port = 5432
-    wait_socket_available((ip, port), 20)
+    wait_socket_available((ip, port), 30)
     yield container
 
 

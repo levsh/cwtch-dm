@@ -19,7 +19,7 @@ classifiers = [
 [tool.poetry.dependencies]
 python = ">=3.11, <4.0"
 asyncpg = "*"
-cwtch = "*"
+cwtch = { path = "../cwtch/" }
 sqlalchemy = { version="^2", extras=["asyncio"] }
 
 [tool.poetry.group.test.dependencies]
