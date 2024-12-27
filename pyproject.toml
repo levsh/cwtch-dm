@@ -1,12 +1,12 @@
 [tool.poetry]
-name = "nepente"
-version = "0.1.0a0"
+name = "cwtch-dm"
+version = "0.1.0"
 description = ""
 authors = ["Roman Koshel <roma.koshel@gmail.com>"]
 license = "MIT"
 readme = "README.md"
 keywords = []
-packages = [{ include = "nepente" }]
+packages = [{ include = "cwtch_dm" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python",

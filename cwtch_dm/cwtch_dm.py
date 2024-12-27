@@ -4,7 +4,7 @@ import typing
 from asyncio import gather
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Any, Callable, Literal, Never, Optional, Protocol, Type
+from typing import Any, AsyncIterator, Callable, Literal, Never, Optional, Protocol, Type
 
 import sqlalchemy as sa
 
@@ -16,24 +16,24 @@ from sqlalchemy.orm import DeclarativeBase, aliased
 
 
 __all__ = [
-    "NepenteError",
+    "DMError",
     "AlreadyExistsError",
     "BadParamsError",
     "NotFoundError",
     "OrderBy",
     "bind_engine",
     "transaction",
-    "Get",
-    "Create",
-    "Save",
-    "Update",
-    "Delete",
-    "CRUD",
+    "GetDM",
+    "CreateDM",
+    "SaveDM",
+    "UpdateDM",
+    "DeleteDM",
+    "DM",
 ]
 
 
 _conn: dict[str | None, ContextVar] = {}
-_engine = {}
+_engine: dict[str | None, sa.ext.asyncio.AsyncEngine] = {}
 
 
 @dataclass
@@ -42,11 +42,11 @@ class OrderBy:
     order: Literal["asc", "desc"] = "asc"
 
 
-class NepenteError(Exception):
+class DMError(Exception):
     pass
 
 
-class BadParamsError(NepenteError):
+class BadParamsError(DMError):
     def __init__(self, message: str, param: Optional[str] = None):
         self.message = message
         self.param = param
@@ -58,7 +58,7 @@ class BadParamsError(NepenteError):
         return self.__str__()
 
 
-class NotFoundError(NepenteError):
+class NotFoundError(DMError):
     def __init__(self, key, value):
         self.key = key
         self.value = value
@@ -67,7 +67,7 @@ class NotFoundError(NepenteError):
         return f"item with ({self.key})=({self.value}) not found"
 
 
-class AlreadyExistsError(NepenteError):
+class AlreadyExistsError(DMError):
     def __init__(self, key, value):
         self.key = key
         self.value = value
@@ -76,13 +76,13 @@ class AlreadyExistsError(NepenteError):
         return f"key ({self.key})=({self.value}) already exists"
 
 
-def bind_engine(engine, name: Optional[str] = None):
+def bind_engine(engine: sa.ext.asyncio.AsyncEngine, name: Optional[str] = None):
     _engine[name] = engine
     _conn[name] = ContextVar("conn", default=None)
 
 
 @asynccontextmanager
-async def transaction(engine_name: Optional[str] = None):
+async def transaction(engine_name: Optional[str] = None) -> AsyncIterator[sa.ext.asyncio.AsyncConnection]:
     if (conn := _conn[engine_name].get()) is None:
         async with _engine[engine_name].connect() as conn:
             async with conn.begin():
@@ -96,7 +96,7 @@ async def transaction(engine_name: Optional[str] = None):
 
 
 @asynccontextmanager
-async def get_conn(engine_name: Optional[str] = None):
+async def get_conn(engine_name: Optional[str] = None) -> AsyncIterator[sa.ext.asyncio.AsyncConnection]:
     if (conn := _conn[engine_name].get()) is None:
         async with _engine[engine_name].connect() as conn:
             async with conn.begin():
@@ -140,8 +140,8 @@ class Meta(typing._ProtocolMeta):
 
             all_bases = get_all_bases(bases)
 
-            if Get not in all_bases:
-                raise TypeError(f"Any nepente class should be subclassed from {Get}")
+            if GetDM not in all_bases:
+                raise TypeError(f"Any mapper class should be subclassed from {GetDM}")
 
             if (model_db := ns.get("model_db")) is None:
                 raise ValueError("`model_db` field is required")
@@ -152,7 +152,7 @@ class Meta(typing._ProtocolMeta):
             if not any((getattr(model, "__cwtch_model__", None), getattr(model, "__cwtch_view__", None))):
                 raise ValueError("`model` is not cwtch model")
 
-            if Create in all_bases or Save in all_bases:
+            if CreateDM in all_bases or SaveDM in all_bases:
                 if (model_create := ns.get("model_create")) is None:
                     raise ValueError("`model_create` field is required")
                 if not any(
@@ -165,7 +165,7 @@ class Meta(typing._ProtocolMeta):
                 ns["_fields_create"] = set(model_db.__table__.columns.keys()) & set(model_create.__dataclass_fields__)
                 assert ns["_fields_create"]  # TODO
 
-            if Save in all_bases:
+            if SaveDM in all_bases:
                 if (model_save := ns.get("model_save")) is None:
                     raise ValueError("`model_save` field is required")
                 if not any(
@@ -178,7 +178,7 @@ class Meta(typing._ProtocolMeta):
                 ns["_fields_save"] = set(model_db.__table__.columns.keys()) & set(model_save.__dataclass_fields__)
                 assert ns["_fields_save"]  # TODO
 
-            if Update in all_bases:
+            if UpdateDM in all_bases:
                 if (model_update := ns.get("model_update")) is None:
                     raise ValueError("`model_update` field is required")
                 if not any(
@@ -194,7 +194,7 @@ class Meta(typing._ProtocolMeta):
         return super().__new__(cls, name, bases, ns)
 
 
-class _GetProtocol(Protocol):
+class _BaseProtocol(Protocol):
     engine_name: Optional[str]
 
     model_db: Type[DeclarativeBase]
@@ -233,7 +233,7 @@ class _GetProtocol(Protocol):
         joinedload: Optional[dict] = None,
         model_out: Optional[Type] = None,
         **kwds,
-    ): ...
+    ) -> Optional[type]: ...
 
     @classmethod
     async def get_many(
@@ -247,7 +247,7 @@ class _GetProtocol(Protocol):
     ) -> tuple[int, list]: ...
 
 
-class Get(_GetProtocol, metaclass=Meta, skip_checks=True):
+class GetDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
     engine_name: Optional[str] = None
 
     model_db: Type[DeclarativeBase] = typing.cast(Type[DeclarativeBase], None)
@@ -341,7 +341,7 @@ class Get(_GetProtocol, metaclass=Meta, skip_checks=True):
         joinedload: Optional[dict] = None,
         model_out: Optional[Type] = None,
         **kwds,
-    ):
+    ) -> Optional[type]:
         key = cls._get_key(key=key)
         query = cls._make_get_query(key, key_value, **kwds)
         model_out = model_out or cls.model
@@ -447,7 +447,7 @@ class Get(_GetProtocol, metaclass=Meta, skip_checks=True):
             ]
 
 
-class Create(_GetProtocol, metaclass=Meta, skip_checks=True):
+class CreateDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
     model_create: Type = typing.cast(Type, None)
 
     index_elements: Optional[list] = None
@@ -542,7 +542,7 @@ class Create(_GetProtocol, metaclass=Meta, skip_checks=True):
         return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
 
 
-class Save(_GetProtocol, metaclass=Meta, skip_checks=True):
+class SaveDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
     model_create: Type = typing.cast(Type, None)
     model_save: Type = typing.cast(Type, None)
 
@@ -649,7 +649,7 @@ class Save(_GetProtocol, metaclass=Meta, skip_checks=True):
             return [from_db(item, data=make_from_db_data(item), model_out=model_out) for item in result.all()]
 
 
-class Update(_GetProtocol, metaclass=Meta, skip_checks=True):
+class UpdateDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
     model_update: Type = typing.cast(Type, None)
     _fields_update: set[str] = set()
 
@@ -704,7 +704,7 @@ class Update(_GetProtocol, metaclass=Meta, skip_checks=True):
                 return typing.cast(list | None, results)
 
 
-class Delete(_GetProtocol, metaclass=Meta, skip_checks=True):
+class DeleteDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
     @classmethod
     def _make_delete_query(cls, key, key_value, returning: Optional[bool] = None):
         query = delete(cls.model_db).where(key == key_value)
@@ -733,4 +733,4 @@ class Delete(_GetProtocol, metaclass=Meta, skip_checks=True):
                 return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
 
 
-class CRUD(Get, Create, Save, Update, Delete, skip_checks=True): ...
+class DM(GetDM, CreateDM, SaveDM, UpdateDM, DeleteDM, skip_checks=True): ...
