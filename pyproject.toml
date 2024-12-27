@@ -19,6 +19,7 @@ classifiers = [
 [tool.poetry.dependencies]
 python = ">=3.11, <4.0"
 asyncpg = "*"
+# cwtch = ">=0.10.0"
 cwtch = { path = "../cwtch/" }
 sqlalchemy = { version="^2", extras=["asyncio"] }
 
@@ -41,3 +42,10 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.black]
 line-length = 120
+
+[tool.isort]
+indent = 4
+lines_after_imports = 2
+lines_between_types = 1
+src_paths = ["."]
+profile = "black"

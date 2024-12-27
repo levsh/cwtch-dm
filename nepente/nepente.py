@@ -1,15 +1,19 @@
 import re
 import typing
-from asyncio import TaskGroup
+
+from asyncio import gather
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any, Callable, Literal, Never, Type
 
 import sqlalchemy as sa
-from cwtch import asdict, dataclass, from_attributes
-from sqlalchemy import delete, func, insert, literal, select, union_all, update
+
+from cwtch import asdict, dataclass, field, from_attributes
+from sqlalchemy import Row, delete, func, literal, select, union_all, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase, aliased
+
 
 __all__ = [
     "AlreadyExistsError",
@@ -27,9 +31,9 @@ _conn: dict[str | None, ContextVar] = {}
 _engine = {}
 
 
-@dataclass(validate=False)
+@dataclass
 class OrderBy:
-    by: Any
+    by: Any = field(validate=False)
     order: Literal["asc", "desc"] = "asc"
 
 
@@ -105,9 +109,9 @@ async def get_sess(engine_name: str | None = None):
                 yield sess
 
 
-def raise_exc(e: Exception) -> Never:
+def _raise_exc(e: Exception) -> Never:
     if isinstance(e, sa.exc.IntegrityError):
-        detail_match = re.match(r".*\nDETAIL:\s*(?P<text>.*)$", e.orig.args[0])
+        detail_match = re.match(r".*\nDETAIL:\s*(?P<text>.*)$", e.orig.args[0])  # type: ignore
         if detail_match:
             text = detail_match.groupdict()["text"].strip()
             m = re.match(r"Key \((?P<key>.*)\)=\((?P<key_value>.*)\) already exists.", text)
@@ -126,19 +130,19 @@ class Meta(type):
             if (model := ns.get("model")) is None:
                 raise ValueError("model is required")
             if not any((getattr(model, "__cwtch_model__", None), getattr(model, "__cwtch_view__", None))):
-                raise ValueError("model is not cwtch model or view")
+                raise ValueError("model is not cwtch model")
             if (model_create := ns.get("model_create")) is None:
                 raise ValueError("model_create is required or use model_create = False")
             if not any((getattr(model_create, "__cwtch_model__", None), getattr(model_create, "__cwtch_view__", None))):
-                raise ValueError("model_create is not cwtch model or view")
+                raise ValueError("model_create is not cwtch model")
             if (model_save := ns.get("model_save")) is None:
                 raise ValueError("model_save is required or use model_save = False")
             if not any((getattr(model_save, "__cwtch_model__", None), getattr(model_save, "__cwtch_view__", None))):
-                raise ValueError("model_save is not cwtch model or view")
+                raise ValueError("model_save is not cwtch model")
             if (model_update := ns.get("model_update")) is None:
                 raise ValueError("model_update is required or use model_update = False")
             if not any((getattr(model_update, "__cwtch_model__", None), getattr(model_update, "__cwtch_view__", None))):
-                raise ValueError("model_update is not cwtch model or view")
+                raise ValueError("model_update is not cwtch model")
 
             if not isinstance(model_create, bool):
                 ns["_fields_create"] = set(model_db.__table__.columns.keys()) & set(model_create.__dataclass_fields__)
@@ -165,20 +169,17 @@ class Meta(type):
 class CRUD(metaclass=Meta):
     engine_name: str | None = None
 
-    model_db: sa.Table = typing.cast(sa.Table, None)
+    model_db: Type[DeclarativeBase] = typing.cast(Type[DeclarativeBase], None)
 
     model: Type = typing.cast(Type, None)
     model_create: Type | bool = typing.cast(Type, None)
     model_save: Type | bool = typing.cast(Type, None)
     model_update: Type | bool = typing.cast(Type, None)
 
-    key: str | sa.Column = typing.cast(str, None)
+    key = None
     index_elements: list | None = None
 
-    order_by: list[OrderBy] | OrderBy | str | Callable | sa.Column = typing.cast(
-        list[OrderBy] | OrderBy | str | Callable | sa.Column,
-        None,
-    )
+    order_by: list[OrderBy] | OrderBy | str | Callable = typing.cast(list[OrderBy] | OrderBy | str | Callable, None)
 
     joinedload: dict = {}
 
@@ -187,12 +188,12 @@ class CRUD(metaclass=Meta):
     _fields_update: set[str] = set()
 
     @classmethod
-    async def _execute(cls, stmt) -> sa.ResultProxy:
+    async def _execute(cls, query) -> sa.ResultProxy:
         async with get_conn(engine_name=cls.engine_name) as conn:
             try:
-                return await conn.execute(stmt)
+                return await conn.execute(query)
             except Exception as e:
-                raise_exc(e)
+                _raise_exc(e)
 
     @classmethod
     def _get_key(cls, key=None):
@@ -206,45 +207,50 @@ class CRUD(metaclass=Meta):
 
     @classmethod
     def _get_order_by(cls, c, order_by: list[OrderBy] | OrderBy | str | None = None) -> list | None:
-        if order_by is None:
+        _order_by = order_by
+        if _order_by is None:
             if callable(cls.order_by):
-                order_by = cls.order_by(c)
+                _order_by = cls.order_by(c)
             else:
-                order_by = cls.order_by or cls._get_key()  # type: ignore
-        if order_by is not None:
-            if not isinstance(order_by, list):
-                order_by = [order_by]
+                _order_by = cls.order_by or cls._get_key()  # type: ignore
+        if _order_by is not None:
+            if not isinstance(_order_by, list):
+                _order_by = [_order_by]
             else:
-                order_by = list(order_by)
-            order_by: list
-            for i, x in enumerate(order_by):
+                _order_by = list(_order_by)
+            for i, x in enumerate(_order_by):
                 if isinstance(x, OrderBy):
-                    x = OrderBy(by=typing.cast(OrderBy, x).by, order=typing.cast(OrderBy, x).order)
+                    x = OrderBy(by=x.by, order=x.order)  # type: ignore
                 else:
-                    x = OrderBy(by=x)
+                    x = OrderBy(by=x)  # type: ignore
                 if isinstance(x.by, str):
                     if getattr(c, x.by, None) is None:
                         raise BadParamsError(f"invalid order_by '{x.by}'", param=f"{x.by}")
                     x.by = getattr(c, x.by)
-                order_by[i] = getattr(sa, x.order)(x.by)
-        return order_by
+                _order_by[i] = getattr(sa, x.order)(x.by)
+        return typing.cast(list | None, _order_by)
 
     @classmethod
-    def _make_from_db_data(cls, db_item, row: tuple | None = None, joinedload: dict | None = None) -> dict | None:
+    def _make_from_db_data(
+        cls,
+        db_item,
+        row: tuple | None = None,
+        joinedload: dict | None = None,
+    ) -> dict | None:
         return {}
 
     @classmethod
     def _from_db(
         cls,
-        data_db,
+        item: Row,
         data: dict | None = None,
         exclude: list | None = None,
         suffix: str | None = None,
         model_out=None,
-    ):
+    ) -> type:
         return from_attributes(
             model_out or cls.model,
-            data_db,
+            item,
             data=data,
             exclude=exclude,
             suffix=suffix,
@@ -252,68 +258,86 @@ class CRUD(metaclass=Meta):
         )
 
     @classmethod
-    def _get_create_values(cls, model) -> dict:
-        return asdict(model, include=cls._fields_create)
+    def _get_values_for_create_query(cls, model) -> dict:
+        return asdict(model, include=typing.cast(list[str], cls._fields_create))
 
     @classmethod
-    def _make_create_stmt(cls, model, returning: bool | None = None):
+    def _make_create_query(cls, model, returning: bool | None = None):
+        model_db = cls.model_db
+        query = insert(model_db).values(cls._get_values_for_create_query(model))
         if returning:
-            model_db = cls.model_db
-            return insert(model_db).values(cls._get_create_values(model)).returning(model_db)
-        return insert(cls.model_db).values(cls._get_create_values(model))
+            query = query.returning(model_db)
+        return query
 
     @classmethod
-    async def create(cls, model, model_out: Type | None = None, returning: bool = True):
-        item_db = (await cls._execute(cls._make_create_stmt(model, returning=returning))).one()
-        return cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
-
-    @classmethod
-    def _make_create_many_stmt(cls, models: list, returning: bool | None = None):
+    async def create(
+        cls,
+        model,
+        model_out: Type | None = None,
+        returning: bool | None = None,
+    ):
+        result = await cls._execute(cls._make_create_query(model, returning=returning))
         if returning:
-            model_db = cls.model_db
-            return insert(model_db).values([cls._get_create_values(model) for model in models]).returning(model_db)
-        return insert(cls.model_db).values([cls._get_create_values(model) for model in models])
+            item = result.one()
+            model_out = model_out or cls.model
+            return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
 
     @classmethod
-    async def create_many(cls, models: list, model_out: Type | None = None, returning: bool = True) -> list:
+    def _make_create_many_query(cls, models: list, returning: bool | None = None):
+        model_db = cls.model_db
+        query = insert(cls.model_db).values([cls._get_values_for_create_query(model) for model in models])
+        if returning:
+            query = query.returning(model_db)
+        return query
+
+    @classmethod
+    async def create_many(
+        cls,
+        models: list,
+        model_out: Type | None = None,
+        returning: bool | None = None,
+    ) -> list | None:
         if not models:
             return []
-        if len({model.__class__ for model in models}) > 1:
-            raise ValueError("mix of different models not supported")
-        return [
-            cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
-            for item_db in (await cls._execute(cls._make_create_many_stmt(models, returning=returning))).all()
-        ]
+        result = await cls._execute(cls._make_create_many_query(models, returning=returning))
+        if returning:
+            from_db = cls._from_db
+            make_from_db_data = cls._make_from_db_data
+            model_out = model_out or cls.model
+            return [from_db(item, data=make_from_db_data(item), model_out=model_out) for item in result.all()]
 
     @classmethod
-    def _get_save_values(cls, model) -> dict:
+    def _get_values_for_save_query(cls, model) -> dict:
         if isinstance(model, typing.cast(Type, cls.model_create)):
-            return asdict(model, include=cls._fields_create)
-        return asdict(model, include=cls._fields_save)
+            return asdict(model, include=typing.cast(list[str], cls._fields_create))
+        return asdict(model, include=typing.cast(list[str], cls._fields_save))
 
     @classmethod
-    def _get_save_set(cls, excluded, model) -> dict:
+    def _get_on_conflict_do_update_set_for_save_query(cls, excluded, model) -> dict:
         if isinstance(model, typing.cast(Type, cls.model_create)):
             return {k: getattr(excluded, k) for k in cls._create_fields}
         return {k: getattr(excluded, k) for k in cls._fields_save}
 
     @classmethod
-    def _make_save_stmt(cls, model, index_elements: list | None = None, returning: bool | None = None):
+    def _make_save_query(
+        cls,
+        model,
+        index_elements: list | None = None,
+        returning: bool | None = None,
+    ):
         model_db = cls.model_db
-        stmt = insert(model_db).values(cls._get_save_values(model))
+        query = insert(model_db).values(cls._get_values_for_save_query(model))
         index_elements = index_elements or cls.index_elements
         if index_elements is None:
             raise ValueError("index_elements is None")
         index_elements = list(map(lambda e: isinstance(e, str) and getattr(model_db, e) or e, index_elements))
-        if returning:
-            return stmt.on_conflict_do_update(
-                index_elements=index_elements,
-                set_=cls._get_save_set(stmt.excluded, model),
-            ).returning(model_db)
-        return stmt.on_conflict_do_update(
+        query = query.on_conflict_do_update(
             index_elements=index_elements,
-            set_=cls._get_save_set(stmt.excluded, model),
+            set_=cls._get_on_conflict_do_update_set_for_save_query(query.excluded, model),
         )
+        if returning:
+            query = query.returning(model_db)
+        return query
 
     @classmethod
     async def save(
@@ -321,36 +345,40 @@ class CRUD(metaclass=Meta):
         model,
         index_elements: list | None = None,
         model_out: Type | None = None,
-        returning: bool = True,
+        returning: bool | None = None,
     ):
-        item_db = (
-            await cls._execute(
-                cls._make_save_stmt(
-                    model,
-                    index_elements=index_elements,
-                    returning=returning,
-                )
+        result = await cls._execute(
+            cls._make_save_query(
+                model,
+                index_elements=index_elements,
+                returning=returning,
             )
-        ).one()
-        return cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
+        )
+        if returning:
+            item = result.one()
+            model_out = model_out or cls.model
+            return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
 
     @classmethod
-    def _make_save_many_stmt(cls, models: list, index_elements: list | None = None, returning: bool | None = None):
+    def _make_save_many_query(
+        cls,
+        models: list,
+        index_elements: list | None = None,
+        returning: bool | None = None,
+    ):
         model_db = cls.model_db
-        stmt = insert(model_db).values([cls._get_save_values(model) for model in models])
+        query = insert(model_db).values([cls._get_values_for_save_query(model) for model in models])
         index_elements = index_elements or cls.index_elements
         if index_elements is None:
             raise ValueError("index_elements is None")
         index_elements = list(map(lambda e: isinstance(e, str) and getattr(model_db, e) or e, index_elements))
-        if returning:
-            return stmt.on_conflict_do_update(
-                index_elements=index_elements,
-                set_=cls._get_save_set(stmt.excluded, models[0]),
-            ).returning(model_db)
-        return stmt.on_conflict_do_update(
+        query = query.on_conflict_do_update(
             index_elements=index_elements,
-            set_=cls._get_save_set(stmt.excluded, models[0]),
+            set_=cls._get_on_conflict_do_update_set_for_save_query(query.excluded, models[0]),
         )
+        if returning:
+            query = query.returning(model_db)
+        return query
 
     @classmethod
     async def save_many(
@@ -358,45 +386,39 @@ class CRUD(metaclass=Meta):
         models: list,
         index_elements: list | None = None,
         model_out: Type | None = None,
-        returning: bool = True,
-    ) -> list:
+        returning: bool | None = None,
+    ) -> list | None:
         if not models:
             return []
-        if len({model.__class__ for model in models}) > 1:
-            raise ValueError("mix of different models not supported")
-        return [
-            cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
-            for item_db in (
-                await cls._execute(
-                    cls._make_save_many_stmt(
-                        models,
-                        index_elements=index_elements,
-                        returning=returning,
-                    )
-                )
-            ).all()
-        ]
-
-    @classmethod
-    def _get_update_values(cls, model) -> dict:
-        return asdict(model, include=cls._fields_update, exclude_unset=True)
-
-    @classmethod
-    def _make_update_stmt(cls, model, key: str, returning: bool | None = None):
-        model_db = cls.model_db
-        if returning:
-            return (
-                update(model_db)
-                .values(cls._get_update_values(model))
-                .where(getattr(model_db, key) == getattr(model, key))
-                .returning(model_db)
+        result = await cls._execute(
+            cls._make_save_many_query(
+                models,
+                index_elements=index_elements,
+                returning=returning,
             )
-        return (
+        )
+        if returning:
+            from_db = cls._from_db
+            make_from_db_data = cls._make_from_db_data
+            model_out = model_out or cls.model
+            return [from_db(item, data=make_from_db_data(item), model_out=model_out) for item in result.all()]
+
+    @classmethod
+    def _get_values_for_update_query(cls, model) -> dict:
+        return asdict(model, include=typing.cast(list[str], cls._fields_update), exclude_unset=True)
+
+    @classmethod
+    def make_update_query(cls, model, key: str, returning: bool | None = None):
+        model_db = cls.model_db
+        query = (
             update(model_db)
-            .values(cls._get_update_values(model))
+            .values(cls._get_values_for_update_query(model))
             .where(getattr(model_db, key) == getattr(model, key))
             .returning(getattr(model_db, key))
         )
+        if returning:
+            query = query.returning(model_db)
+        return query
 
     @classmethod
     async def update(
@@ -404,13 +426,17 @@ class CRUD(metaclass=Meta):
         model,
         key: str,
         model_out: Type | None = None,
-        returning: bool = True,
+        returning: bool | None = None,
+        raise_not_found: bool | None = None,
     ):
-        if item_db := (await cls._execute(cls._make_update_stmt(model, key, returning=returning))).one_or_none():
-            if returning:
-                return cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
-        else:
+        result = await cls._execute(cls.make_update_query(model, key, returning=returning or raise_not_found))
+        if raise_not_found and result.rowcount == 0:
             raise NotFoundError(key=key, value=getattr(model, key))
+        if returning:
+            item = result.one_or_none()
+            if item:
+                model_out = model_out or cls.model
+                return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
 
     @classmethod
     async def update_many(
@@ -418,16 +444,17 @@ class CRUD(metaclass=Meta):
         models: list,
         key: str,
         model_out: Type | None = None,
-        returning: bool = True,
-    ) -> list:
-        async with TaskGroup() as tg:
-            tasks = [
-                tg.create_task(cls.update(model, key, model_out=model_out, returning=returning)) for model in models
-            ]
-        return [await task for task in tasks]
+        returning: bool | None = None,
+    ) -> list | None:
+        async with transaction():
+            results = await gather(
+                *[cls.update(model, key, model_out=model_out, returning=returning) for model in models]
+            )
+            if returning:
+                return typing.cast(list | None, results)
 
     @classmethod
-    def _make_get_stmt(cls, key, key_value, **kwds):
+    def _make_get_query(cls, key, key_value, **kwds):
         return select(cls.model_db).where(key == key_value)
 
     @classmethod
@@ -441,11 +468,12 @@ class CRUD(metaclass=Meta):
         **kwds,
     ):
         key = cls._get_key(key=key)
-        stmt = cls._make_get_stmt(key, key_value, **kwds)
+        query = cls._make_get_query(key, key_value, **kwds)
+        model_out = model_out or cls.model
 
         if joinedload is None or not any(joinedload.values()):
-            if item_db := (await cls._execute(stmt)).one_or_none():
-                return cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
+            if item := (await cls._execute(query)).one_or_none():
+                return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
             if raise_not_found:
                 raise NotFoundError(key=key, value=key_value)
             return
@@ -453,30 +481,30 @@ class CRUD(metaclass=Meta):
         exclude = []
         for k, v in cls.joinedload.items():
             if joinedload.get(k) is True:
-                stmt = stmt.options(v)
+                query = query.options(v(cls.model_db))
             else:
                 exclude.append(k)
 
         async with get_sess(engine_name=cls.engine_name) as sess:
-            if item_db := (await sess.execute(stmt)).unique().scalars().one_or_none():
+            if item := (await sess.execute(query)).unique().scalars().one_or_none():
                 return cls._from_db(
-                    item_db,
+                    item,
                     exclude=exclude,
-                    data=cls._make_from_db_data(item_db, joinedload=joinedload),
+                    data=cls._make_from_db_data(item, joinedload=joinedload),
                     model_out=model_out,
                 )
             if raise_not_found:
                 raise NotFoundError(key=key, value=key_value)
 
     @classmethod
-    def _make_get_many_stmt(
+    def _make_get_many_query(
         cls,
         order_by: list[OrderBy] | OrderBy | str | None = None,
         **kwds,
     ):
-        return select(func.count(literal("*")).over().label("rows_total"), cls.model_db).order_by(
-            *cls._get_order_by(cls.model_db, order_by)
-        )
+        query = select(func.count(literal("*")).over().label("rows_total"), cls.model_db)
+        query = query.order_by(*cls._get_order_by(cls.model_db, order_by))
+        return query
 
     @classmethod
     async def get_many(
@@ -489,47 +517,48 @@ class CRUD(metaclass=Meta):
         **kwds,
     ) -> tuple[int, list]:
         model_db = cls.model_db
+        model_out = model_out or cls.model
 
-        stmt = cls._make_get_many_stmt(**kwds)
+        query = cls._make_get_many_query(order_by=order_by, **kwds)
 
-        cte = stmt.cte("cte")
+        cte = query.cte("cte")
 
-        stmt = select(literal(1).label("i"), cte)
+        query = select(literal(1).label("i"), cte)
 
         if page_size:
             page = page or 1
-            stmt = stmt.limit(page_size).offset((page - 1) * page_size)
+            query = query.limit(page_size).offset((page - 1) * page_size)
 
-        stmt = union_all(select(literal(0).label("i"), cte).limit(1), stmt)
+        query = union_all(select(literal(0).label("i"), cte).limit(1), query)
 
         from_db = cls._from_db
         make_from_orm_data = cls._make_from_db_data
 
         if joinedload is None or not any(joinedload.values()):
-            rows = (await cls._execute(stmt)).all()
+            rows = (await cls._execute(query)).all()
             return rows[0].rows_total if rows else 0, [
                 from_db(row, data=make_from_orm_data(row), model_out=model_out) for row in rows[1:]
             ]
 
-        main_cte = stmt.cte("main_cte")
+        main_cte = query.cte("main_cte")
 
         model_db_alias = aliased(model_db, main_cte)  # type: ignore
-        stmt = select(main_cte, model_db_alias)
+        query = select(main_cte, model_db_alias)
 
         exclude = []
         for k, v in cls.joinedload.items():
             if joinedload.get(k) is True:
-                stmt = stmt.options(v(model_db_alias))
+                query = query.options(v(model_db_alias))
             else:
                 exclude.append(k)
 
-        stmt = stmt.order_by(sa.asc(main_cte.c.i), *cls._get_order_by(main_cte.c, order_by))
+        query = query.order_by(sa.asc(main_cte.c.i), *cls._get_order_by(main_cte.c, order_by))
 
         def _hash(row):
             return hash((row[0], row[1], row[-1]))
 
         async with get_sess(engine_name=cls.engine_name) as sess:
-            rows = (await sess.execute(stmt)).unique(_hash).all()
+            rows = (await sess.execute(query)).unique(_hash).all()
             return rows[0].rows_total if rows else 0, [
                 from_db(
                     row[-1],
@@ -541,16 +570,21 @@ class CRUD(metaclass=Meta):
             ]
 
     @classmethod
-    def _make_get_or_create_stmt(cls, model, update_element: str, index_elements: list | None = None):
+    def _make_get_or_create_query(
+        cls,
+        model,
+        update_element: str,
+        index_elements: list | None = None,
+    ):
         model_db = cls.model_db
-        stmt = insert(model_db).values(cls._get_create_values(model))
+        query = insert(model_db).values(cls._get_values_for_create_query(model))
         index_elements = index_elements or cls.index_elements
         if index_elements is None:
             raise ValueError("index_elements is None")
         index_elements = list(map(lambda e: isinstance(e, str) and getattr(model_db, e) or e, index_elements))
-        return stmt.on_conflict_do_update(
+        return query.on_conflict_do_update(
             index_elements=index_elements,
-            set_={update_element: getattr(stmt.excluded, update_element)},
+            set_={update_element: getattr(query.excluded, update_element)},
         ).returning(model_db)
 
     @classmethod
@@ -561,22 +595,24 @@ class CRUD(metaclass=Meta):
         index_elements: list | None = None,
         model_out: Type | None = None,
     ):
-        item_db = (
+        model_out = model_out or cls.model
+        item = (
             await cls._execute(
-                cls._make_get_or_create_stmt(
+                cls._make_get_or_create_query(
                     model,
                     update_element,
                     index_elements=index_elements,
                 )
             )
         ).one()
-        return cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
+        return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
 
     @classmethod
-    def _make_delete_stmt(cls, key, key_value, returning: bool | None = None):
+    def _make_delete_query(cls, key, key_value, returning: bool = True):
+        query = delete(cls.model_db).where(key == key_value)
         if returning:
-            return delete(cls.model_db).where(key == key_value).returning(cls.model_db)
-        return delete(cls.model_db).where(key == key_value)
+            query = query.returning(cls.model_db)
+        return query
 
     @classmethod
     async def delete(
@@ -588,14 +624,12 @@ class CRUD(metaclass=Meta):
         model_out: Type | None = None,
     ):
         key = cls._get_key(key=key)
+        result = await cls._execute(cls._make_delete_query(key, key_value))
+        if raise_not_found:
+            if raise_not_found and result.rowcount == 0:
+                raise NotFoundError(key=key, value=key_value)
         if returning:
-            item_db = (await cls._execute(cls._make_delete_stmt(key, key_value, returning=returning))).one_or_none()
-            if raise_not_found and item_db is None:
-                raise NotFoundError(key=key, value=key_value)
-            if item_db:
-                return cls._from_db(item_db, data=cls._make_from_db_data(item_db), model_out=model_out)
-        else:
-            result = await cls._execute(cls._make_delete_stmt(key, key_value))
-            if raise_not_found and result.rowcount != 1:
-                raise NotFoundError(key=key, value=key_value)
-            return result.rowcount
+            item = result.one_or_none()
+            if item:
+                model_out = model_out or cls.model
+                return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
