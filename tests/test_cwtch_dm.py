@@ -8,7 +8,7 @@ import sqlalchemy as sa
 
 from cwtch import dataclass, resolve_types, view
 from cwtch.types import UNSET, Unset
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from cwtch_dm import DM, NotFoundError, bind_engine
 
@@ -20,18 +20,18 @@ class BaseDB(DeclarativeBase):
 class ParentDB(BaseDB):
     __tablename__ = "parents"
 
-    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    name = sa.Column(sa.String, nullable=False)
-    data = sa.Column(sa.String, nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str]
+    data: Mapped[str]
     children = relationship("ChildDB", uselist=True, viewonly=True)
 
 
 class ChildDB(BaseDB):
     __tablename__ = "children"
 
-    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    name = sa.Column(sa.String, nullable=False)
-    parent_id = sa.Column(sa.Integer, sa.ForeignKey("parents.id"), nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str]
+    parent_id: Mapped[int] = mapped_column(sa.ForeignKey("parents.id"))
     parent = relationship("ParentDB", uselist=False, viewonly=True)
 
 
