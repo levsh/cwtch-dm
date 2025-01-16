@@ -4,12 +4,12 @@ import typing
 from asyncio import gather
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Any, AsyncIterator, Callable, Literal, Never, Optional, Protocol, Type
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Callable, Literal, Never, Optional, Protocol, Type, TypeVar
 
 import sqlalchemy as sa
 
-from cwtch import asdict, dataclass, field, from_attributes
-from sqlalchemy import Row, delete, func, literal, select, union_all, update
+from sqlalchemy import delete, func, literal, select, union_all, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, aliased
@@ -23,23 +23,11 @@ __all__ = [
     "OrderBy",
     "bind_engine",
     "transaction",
-    "GetDM",
-    "CreateDM",
-    "SaveDM",
-    "UpdateDM",
-    "DeleteDM",
-    "DM",
 ]
 
 
-_conn: dict[str | None, ContextVar] = {}
-_engine: dict[str | None, sa.ext.asyncio.AsyncEngine] = {}
-
-
-@dataclass
-class OrderBy:
-    by: Any = field(validate=False)
-    order: Literal["asc", "desc"] = "asc"
+_conn: dict[Optional[str], ContextVar] = {}
+_engine: dict[Optional[str], sa.ext.asyncio.AsyncEngine] = {}
 
 
 class DMError(Exception):
@@ -76,7 +64,15 @@ class AlreadyExistsError(DMError):
         return f"key ({self.key})=({self.value}) already exists"
 
 
+@dataclass
+class OrderBy:
+    by: Any
+    order: Literal["asc", "desc"] = "asc"
+
+
 def bind_engine(engine: sa.ext.asyncio.AsyncEngine, name: Optional[str] = None):
+    if engine.dialect.name != "postgresql":
+        raise DMError("only 'postgresql' dialect is supported")
     _engine[name] = engine
     _conn[name] = ContextVar("conn", default=None)
 
@@ -127,71 +123,7 @@ def _raise_exc(e: Exception) -> Never:
     raise e
 
 
-class Meta(typing._ProtocolMeta):
-    def __new__(cls, name, bases, ns, skip_checks: bool = False):
-        if not skip_checks:
-
-            def get_all_bases(bases: tuple) -> set:
-                result = set()
-                for base in bases:
-                    result.add(base)
-                    result |= get_all_bases(getattr(base, "__bases__", ()))
-                return result
-
-            all_bases = get_all_bases(bases)
-
-            if GetDM not in all_bases:
-                raise TypeError(f"Any mapper class should be subclassed from {GetDM}")
-
-            if (model_db := ns.get("model_db")) is None:
-                raise ValueError("`model_db` field is required")
-
-            if (model := ns.get("model")) is None:
-                raise ValueError("`model` field is required")
-
-            if not any((getattr(model, "__cwtch_model__", None), getattr(model, "__cwtch_view__", None))):
-                raise ValueError("`model` is not cwtch model")
-
-            if CreateDM in all_bases or SaveDM in all_bases:
-                if (model_create := ns.get("model_create")) is None:
-                    raise ValueError("`model_create` field is required")
-                if not any(
-                    (
-                        getattr(model_create, "__cwtch_model__", None),
-                        getattr(model_create, "__cwtch_view__", None),
-                    )
-                ):
-                    raise ValueError("`model_create` is not cwtch model")
-                ns["_fields_create"] = set(model_db.__table__.columns.keys()) & set(model_create.__dataclass_fields__)
-                assert ns["_fields_create"]  # TODO
-
-            if SaveDM in all_bases:
-                if (model_save := ns.get("model_save")) is None:
-                    raise ValueError("`model_save` field is required")
-                if not any(
-                    (
-                        getattr(model_save, "__cwtch_model__", None),
-                        getattr(model_save, "__cwtch_view__", None),
-                    )
-                ):
-                    raise ValueError("`model_save` is not cwtch model")
-                ns["_fields_save"] = set(model_db.__table__.columns.keys()) & set(model_save.__dataclass_fields__)
-                assert ns["_fields_save"]  # TODO
-
-            if UpdateDM in all_bases:
-                if (model_update := ns.get("model_update")) is None:
-                    raise ValueError("`model_update` field is required")
-                if not any(
-                    (
-                        getattr(model_update, "__cwtch_model__", None),
-                        getattr(model_update, "__cwtch_view__", None),
-                    )
-                ):
-                    raise ValueError("`model_update` is not cwtch model")
-                ns["_fields_update"] = set(model_db.__table__.columns.keys()) & set(model_update.__dataclass_fields__)
-                assert ns["_fields_update"]  # TODO
-
-        return super().__new__(cls, name, bases, ns)
+ModelDB = TypeVar("ModelDB", bound=DeclarativeBase)
 
 
 class _BaseProtocol(Protocol):
@@ -209,12 +141,12 @@ class _BaseProtocol(Protocol):
         db_item,
         row: Optional[tuple] = None,
         joinedload: Optional[dict] = None,
-    ) -> Optional[dict]: ...
+    ) -> dict: ...
 
     @classmethod
     def _from_db(
         cls,
-        item: Row | DeclarativeBase,
+        item: sa.Row | ModelDB,
         data: Optional[dict] = None,
         exclude: Optional[list] = None,
         suffix: Optional[str] = None,
@@ -238,6 +170,7 @@ class _BaseProtocol(Protocol):
     @classmethod
     async def get_many(
         cls,
+        flt: Optional[sa.sql.elements.BinaryExpression] = None,
         page: Optional[int] = None,
         page_size: Optional[int] = None,
         order_by: Optional[list[OrderBy | str] | OrderBy | str] = None,
@@ -247,7 +180,86 @@ class _BaseProtocol(Protocol):
     ) -> tuple[int, list]: ...
 
 
-class GetDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
+class _Meta(typing._ProtocolMeta):
+    def __new__(cls, name, bases, ns, skip_checks: bool = False):
+        if not skip_checks:
+
+            def get_all_bases(bases: tuple) -> set:
+                result = set()
+                for base in bases:
+                    result.add(base)
+                    result |= get_all_bases(getattr(base, "__bases__", ()))
+                return result
+
+            all_bases = get_all_bases(bases)
+
+            if _GetDM not in all_bases:
+                raise TypeError("Any DM class should be subclassed from GetDM class")
+
+            if (model_db := ns.get("model_db")) is None:
+                raise ValueError("'model_db' field is required")
+
+            if (model := ns.get("model")) is None:
+                raise ValueError("'model' field is required")
+
+            if (
+                getattr(model, "__dataclass_fields__", None) is None
+                and getattr(model, "__pydantic_fields__", None) is None
+            ):
+                raise ValueError("'model' is not a valid model")
+
+            if _CreateDM in all_bases or _SaveDM in all_bases:
+                if (model_create := ns.get("model_create")) is None:
+                    raise ValueError("'model_create' field is required")
+                if (
+                    getattr(model_create, "__dataclass_fields__", None) is None
+                    and getattr(model_create, "__pydantic_fields__", None) is None
+                ):
+                    raise ValueError("'model_create' is not a valid model")
+                ns["_fields_create"] = set(model_db.__table__.columns.keys()) & set(
+                    getattr(model_create, "__dataclass_fields__", None)
+                    or getattr(model_create, "__pydantic_fields__", None)
+                    or set()
+                )
+                if not ns["_fields_create"]:
+                    raise DMError("model_create does not contain valid fields")
+
+            if _SaveDM in all_bases:
+                if (model_save := ns.get("model_save")) is None:
+                    raise ValueError("'model_save' field is required")
+                if (
+                    getattr(model_save, "__dataclass_fields__", None) is None
+                    and getattr(model_save, "__pydantic_fields__", None) is None
+                ):
+                    raise ValueError("'model_save' is not a valid model")
+                ns["_fields_save"] = set(model_db.__table__.columns.keys()) & set(
+                    getattr(model_save, "__dataclass_fields__", None)
+                    or getattr(model_save, "__pydantic_fields__", None)
+                    or set()
+                )
+                if not ns["_fields_save"]:
+                    raise DMError("model_save does not contain valid fields")
+
+            if _UpdateDM in all_bases:
+                if (model_update := ns.get("model_update")) is None:
+                    raise ValueError("'model_update' field is required")
+                if (
+                    getattr(model_update, "__dataclass_fields__", None) is None
+                    and getattr(model_update, "__pydantic_fields__", None) is None
+                ):
+                    raise ValueError("'model_update' is not a valid model")
+                ns["_fields_update"] = set(model_db.__table__.columns.keys()) & set(
+                    getattr(model_update, "__dataclass_fields__", None)
+                    or getattr(model_update, "__pydantic_fields__", None)
+                    or set()
+                )
+                if not ns["_fields_update"]:
+                    raise DMError("model_update does not contain valid fields")
+
+        return super().__new__(cls, name, bases, ns)
+
+
+class _GetDM(_BaseProtocol, metaclass=_Meta, skip_checks=True):
     engine_name: Optional[str] = None
 
     model_db: Type[DeclarativeBase] = typing.cast(Type[DeclarativeBase], None)
@@ -272,26 +284,18 @@ class GetDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
         db_item,
         row: Optional[tuple] = None,
         joinedload: Optional[dict] = None,
-    ) -> dict | None:
+    ) -> dict:
         return {}
 
     @classmethod
     def _from_db(
         cls,
-        item: Row | DeclarativeBase,
+        item: sa.Row | ModelDB,
         data: Optional[dict] = None,
         exclude: Optional[list] = None,
         suffix: Optional[str] = None,
         model_out=None,
-    ):
-        return from_attributes(
-            model_out or cls.model,
-            item,
-            data=data,
-            exclude=exclude,
-            suffix=suffix,
-            reset_circular_refs=True,
-        )
+    ): ...
 
     @classmethod
     def _get_key(cls, key=None):
@@ -376,16 +380,20 @@ class GetDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
     @classmethod
     def _make_get_many_query(
         cls,
+        flt: Optional[sa.sql.elements.BinaryExpression] = None,
         order_by: Optional[list[OrderBy | str] | OrderBy | str] = None,
         **kwds,
     ) -> sa.sql.Select:
         query = select(func.count(literal("*")).over().label("rows_total"), cls.model_db)
+        if flt is not None:
+            query = query.where(flt)
         query = query.order_by(*cls._get_order_by(cls.model_db, order_by))
         return query
 
     @classmethod
     async def get_many(
         cls,
+        flt: Optional[sa.sql.elements.BinaryExpression] = None,
         page: Optional[int] = None,
         page_size: Optional[int] = None,
         order_by: Optional[list[OrderBy | str] | OrderBy | str] = None,
@@ -396,7 +404,7 @@ class GetDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
         model_db = cls.model_db
         model_out = model_out or cls.model
 
-        query = cls._make_get_many_query(order_by=order_by, **kwds)
+        query = cls._make_get_many_query(flt=flt, order_by=order_by, **kwds)
 
         cte = query.cte("cte")
 
@@ -447,7 +455,7 @@ class GetDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
             ]
 
 
-class CreateDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
+class _CreateDM(_BaseProtocol, metaclass=_Meta, skip_checks=True):
     model_create: Type = typing.cast(Type, None)
 
     index_elements: Optional[list] = None
@@ -455,8 +463,7 @@ class CreateDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
     _fields_create: set[str] = set()
 
     @classmethod
-    def _get_values_for_create_query(cls, model) -> dict:
-        return asdict(model, include=typing.cast(list[str], cls._fields_create))
+    def _get_values_for_create_query(cls, model) -> dict: ...
 
     @classmethod
     def _make_create_query(cls, model, returning: Optional[bool] = None) -> sa.sql.Insert:
@@ -542,7 +549,7 @@ class CreateDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
         return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
 
 
-class SaveDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
+class _SaveDM(_CreateDM, metaclass=_Meta, skip_checks=True):
     model_create: Type = typing.cast(Type, None)
     model_save: Type = typing.cast(Type, None)
 
@@ -552,10 +559,7 @@ class SaveDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
     _fields_save: set[str] = set()
 
     @classmethod
-    def _get_values_for_save_query(cls, model) -> dict:
-        if isinstance(model, typing.cast(Type, cls.model_create)):
-            return asdict(model, include=typing.cast(list[str], cls._fields_create))
-        return asdict(model, include=typing.cast(list[str], cls._fields_save))
+    def _get_values_for_save_query(cls, model) -> dict: ...
 
     @classmethod
     def _get_on_conflict_do_update_set_for_save_query(cls, excluded, model) -> dict:
@@ -649,13 +653,12 @@ class SaveDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
             return [from_db(item, data=make_from_db_data(item), model_out=model_out) for item in result.all()]
 
 
-class UpdateDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
+class _UpdateDM(_CreateDM, metaclass=_Meta, skip_checks=True):
     model_update: Type = typing.cast(Type, None)
     _fields_update: set[str] = set()
 
     @classmethod
-    def _get_values_for_update_query(cls, model) -> dict:
-        return asdict(model, include=typing.cast(list[str], cls._fields_update), exclude_unset=True)
+    def _get_values_for_update_query(cls, model) -> dict: ...
 
     @classmethod
     def _make_update_query(cls, model, key: str, returning: Optional[bool] = None) -> sa.sql.Update:
@@ -704,7 +707,7 @@ class UpdateDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
                 return typing.cast(list | None, results)
 
 
-class DeleteDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
+class _DeleteDM(_CreateDM, metaclass=_Meta, skip_checks=True):
     @classmethod
     def _make_delete_query(cls, key, key_value, returning: Optional[bool] = None):
         query = delete(cls.model_db).where(key == key_value)
@@ -731,6 +734,3 @@ class DeleteDM(_BaseProtocol, metaclass=Meta, skip_checks=True):
             if item:
                 model_out = model_out or cls.model
                 return cls._from_db(item, data=cls._make_from_db_data(item), model_out=model_out)
-
-
-class DM(GetDM, CreateDM, SaveDM, UpdateDM, DeleteDM, skip_checks=True): ...

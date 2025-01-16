@@ -1,4 +1,4 @@
-# cwtch dm [wip]
+# DBDM [wip]
 
 
 ## Examples
@@ -13,7 +13,7 @@ from cwtch.types import UNSET, Unset
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from cwtch_dm import DM, NotFoundError, bind_engine
+from dbdm import DM, NotFoundError, bind_engine
 
 
 class BaseDB(DeclarativeBase):

@@ -1,12 +1,12 @@
 [tool.poetry]
-name = "cwtch-dm"
+name = "dbdm"
 version = "0.1.0"
 description = ""
 authors = ["Roman Koshel <roma.koshel@gmail.com>"]
 license = "MIT"
 readme = "README.md"
 keywords = []
-packages = [{ include = "cwtch_dm" }]
+packages = [{ include = "dbdm" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python",
@@ -19,14 +19,15 @@ classifiers = [
 [tool.poetry.dependencies]
 python = ">=3.11, <4.0"
 asyncpg = "*"
-cwtch = ">=0.10.0"
 sqlalchemy = { version="^2", extras=["asyncio"] }
 
 [tool.poetry.group.test.dependencies]
 coverage = "*"
+cwtch = ">=0.10.0"
 docker = "*"
+pydantic = "^2"
 pylint = "*"
-pytest = "==7.4.4"
+pytest = "*"
 pytest_asyncio = "*"
 pytest_timeout = "*"
 
